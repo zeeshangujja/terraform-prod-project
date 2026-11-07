@@ -1,4 +1,4 @@
-- name: Deploy the Terraform project (runs on the deployer EC2)
+- name: Deploy (and optionally destroy) the Terraform project on the deployer EC2
   hosts: localhost
   connection: local
   become: true
@@ -6,6 +6,8 @@
     env: dev
     region: eu-north-1
     image_tag: ""
+    action: deploy            # deploy | deploy-and-destroy | destroy-only
+    wait_minutes: 10
     project_dir: "{{ playbook_dir | dirname }}"
     app_dir: "{{ playbook_dir | dirname }}/php-app"
   environment:
@@ -21,6 +23,16 @@
       ansible.builtin.assert:
         that: image_tag | length > 0
         fail_msg: "Pass the image tag with -e image_tag=..."
+
+    - name: Stop if the action is not one of the allowed values
+      ansible.builtin.assert:
+        that: action in ['deploy', 'deploy-and-destroy', 'destroy-only']
+        fail_msg: "action must be deploy, deploy-and-destroy or destroy-only"
+
+    - name: Never destroy prod from the pipeline
+      ansible.builtin.assert:
+        that: env != 'prod' or action == 'deploy'
+        fail_msg: "Destroy is blocked for prod."
 
     - name: Install base packages
       ansible.builtin.apt:
@@ -70,56 +82,81 @@
         chdir: "{{ project_dir }}"
       changed_when: false
 
-    - name: Create the ECR repository first
+    # ---------- Build and deploy (skipped for destroy-only) ----------
+    - name: Build the image and deploy everything
+      when: action != 'destroy-only'
+      block:
+        - name: Create the ECR repository first
+          ansible.builtin.command: >
+            terraform apply -auto-approve -input=false
+            -target=module.ecr
+            -var-file={{ env }}.tfvars
+            -var=image_tag={{ image_tag }}
+          args:
+            chdir: "{{ project_dir }}"
+
+        - name: Read the ECR repository URL
+          ansible.builtin.shell: >
+            echo 'module.ecr.repository_url' |
+            terraform console -var-file={{ env }}.tfvars -var=image_tag={{ image_tag }} |
+            tail -n 1 | tr -d '"'
+          args:
+            chdir: "{{ project_dir }}"
+            executable: /bin/bash
+          register: ecr_url
+          changed_when: false
+
+        - name: Work out the registry and the repository name
+          ansible.builtin.set_fact:
+            ecr_full: "{{ ecr_url.stdout | trim }}"
+            ecr_registry: "{{ (ecr_url.stdout | trim).split('/')[0] }}"
+            ecr_repo: "{{ (ecr_url.stdout | trim).split('/')[1:] | join('/') }}"
+
+        - name: Check if this image tag is already in ECR
+          ansible.builtin.command: >
+            aws ecr describe-images
+            --repository-name {{ ecr_repo }}
+            --image-ids imageTag={{ image_tag }}
+            --region {{ region }}
+          register: image_check
+          failed_when: false
+          changed_when: false
+
+        - name: Build and push the Docker image
+          ansible.builtin.shell: |
+            set -eo pipefail
+            aws ecr get-login-password --region {{ region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
+            docker build -t {{ ecr_full }}:{{ image_tag }} {{ app_dir }}
+            docker push {{ ecr_full }}:{{ image_tag }}
+          args:
+            executable: /bin/bash
+          when: image_check.rc != 0
+
+        - name: Terraform apply (everything else, with the new image)
+          ansible.builtin.command: >
+            terraform apply -auto-approve -input=false
+            -var-file={{ env }}.tfvars
+            -var=image_tag={{ image_tag }}
+          args:
+            chdir: "{{ project_dir }}"
+
+    # ---------- Test window, then destroy ----------
+    - name: Wait so you can test the app before it is destroyed
+      ansible.builtin.wait_for:
+        timeout: "{{ (wait_minutes | int) * 60 }}"
+      delegate_to: localhost
+      when: action == 'deploy-and-destroy' and (wait_minutes | int) > 0
+
+    - name: Terraform destroy (deletes everything Terraform created in this environment)
       ansible.builtin.command: >
-        terraform apply -auto-approve -input=false
-        -target=module.ecr
+        terraform destroy -auto-approve -input=false
         -var-file={{ env }}.tfvars
         -var=image_tag={{ image_tag }}
       args:
         chdir: "{{ project_dir }}"
+      when: action in ['deploy-and-destroy', 'destroy-only']
 
-    - name: Read the ECR repository URL
-      ansible.builtin.shell: >
-        echo 'module.ecr.repository_url' |
-        terraform console -var-file={{ env }}.tfvars -var=image_tag={{ image_tag }} |
-        tail -n 1 | tr -d '"'
-      args:
-        chdir: "{{ project_dir }}"
-        executable: /bin/bash
-      register: ecr_url
+    - name: Remove old Docker images and build cache
+      ansible.builtin.command: docker system prune -af --filter "until=72h"
       changed_when: false
-
-    - name: Work out the registry and the repository name
-      ansible.builtin.set_fact:
-        ecr_full: "{{ ecr_url.stdout | trim }}"
-        ecr_registry: "{{ (ecr_url.stdout | trim).split('/')[0] }}"
-        ecr_repo: "{{ (ecr_url.stdout | trim).split('/')[1:] | join('/') }}"
-
-    - name: Check if this image tag is already in ECR
-      ansible.builtin.command: >
-        aws ecr describe-images
-        --repository-name {{ ecr_repo }}
-        --image-ids imageTag={{ image_tag }}
-        --region {{ region }}
-      register: image_check
       failed_when: false
-      changed_when: false
-
-    - name: Build and push the Docker image
-      ansible.builtin.shell: |
-        set -eo pipefail
-        aws ecr get-login-password --region {{ region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
-        docker build -t {{ ecr_full }}:{{ image_tag }} {{ app_dir }}
-        docker push {{ ecr_full }}:{{ image_tag }}
-      args:
-        executable: /bin/bash
-      when: image_check.rc != 0
-
-    - name: Terraform apply (everything else, with the new image)
-      ansible.builtin.command: >
-        terraform apply -auto-approve -input=false
-        -var-file={{ env }}.tfvars
-        -var=image_tag={{ image_tag }}
-      args:
-        chdir: "{{ project_dir }}"
