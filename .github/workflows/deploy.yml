@@ -4,10 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Environment to deploy"
+        description: "Environment"
         type: choice
         options: [dev, staging, prod]
         default: dev
+      action:
+        description: "What to do"
+        type: choice
+        options: [deploy, deploy-and-destroy, destroy-only]
+        default: deploy-and-destroy
+      wait_minutes:
+        description: "Minutes to wait before destroying (deploy-and-destroy only)"
+        type: string
+        default: "10"
 
 permissions:
   id-token: write
@@ -20,25 +29,24 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 100
     environment: ${{ inputs.env }}
     env:
       TARGET_ENV: ${{ inputs.env }}
+      ACTION: ${{ inputs.action }}
+      WAIT_MINUTES: ${{ inputs.wait_minutes }}
       AWS_REGION: eu-north-1
     steps:
       - uses: actions/checkout@v4
-      - name: Show OIDC claims (debug only)
+
+      - name: Safety checks
         run: |
-          python3 - <<'PY'
-          import os, json, base64, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
-          req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-          tok = json.load(urllib.request.urlopen(req))["value"]
-          p = tok.split(".")[1]
-          p += "=" * (-len(p) % 4)
-          c = json.loads(base64.urlsafe_b64decode(p))
-          print({k: c.get(k) for k in ("sub", "aud", "repository", "environment", "ref")})
-          PY
+          set -euo pipefail
+          if [ "$TARGET_ENV" = "prod" ] && [ "$ACTION" != "deploy" ]; then
+            echo "Destroy is blocked for prod. Use action = deploy."
+            exit 1
+          fi
+          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] || { echo "wait_minutes must be a number"; exit 1; }
 
       - name: Log in to AWS (OIDC, no keys)
         uses: aws-actions/configure-aws-credentials@v4
@@ -60,7 +68,7 @@ jobs:
           aws s3 cp "${TARGET_ENV}.tfvars" "s3://${BUCKET}/releases/${GITHUB_SHA}-${TARGET_ENV}.tfvars"
           rm -f "${TARGET_ENV}.tfvars"
 
-      - name: Deploy on the EC2 through SSM
+      - name: Run Ansible on the EC2 through SSM
         env:
           BUCKET: ${{ vars.ARTIFACT_BUCKET }}
           INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
@@ -89,22 +97,22 @@ jobs:
           aws s3 cp s3://${BUCKET}/${TFVARS_KEY} /opt/deploy/${TARGET_ENV}.tfvars --region ${AWS_REGION}
           trap 'rm -f /opt/deploy/${TARGET_ENV}.tfvars /tmp/release.zip; aws s3 rm s3://${BUCKET}/${TFVARS_KEY} --region ${AWS_REGION} || true' EXIT
           cd /opt/deploy/ansible
-          ansible-playbook deploy.yml -e env=${TARGET_ENV} -e image_tag=${TAG} -e region=${AWS_REGION}
+          ansible-playbook deploy.yml -e env=${TARGET_ENV} -e image_tag=${TAG} -e region=${AWS_REGION} -e run_action=${ACTION} -e wait_minutes=${WAIT_MINUTES}
           EOF
 
-          jq -Rs '{commands: split("\n"), executionTimeout: ["3600"]}' remote.sh > params.json
+          jq -Rs '{commands: split("\n"), executionTimeout: ["4800"]}' remote.sh > params.json
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "deploy ${TARGET_ENV} ${TAG}" \
+            --comment "${ACTION} ${TARGET_ENV} ${TAG}" \
             --parameters file://params.json \
             --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/ssm/terraform-deploy \
             --query "Command.CommandId" --output text)
           echo "SSM command: $CMD_ID"
 
           STATUS="Pending"
-          for i in $(seq 1 240); do
+          for i in $(seq 1 300); do
             STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
               --query "Status" --output text 2>/dev/null || echo "Pending")
             echo "[$i] status: $STATUS"
@@ -114,8 +122,10 @@ jobs:
             sleep 15
           done
 
+          echo "---------- output (last lines) ----------"
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
             --query "StandardOutputContent" --output text | tail -n 60
+          echo "---------- errors (last lines) ----------"
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text | tail -n 30
           test "$STATUS" = "Success"
