@@ -4,3 +4,5 @@
 *.tfstate.*
 *.pem
 crash.log
+*.zip
+.env

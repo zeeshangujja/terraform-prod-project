@@ -12,7 +12,7 @@ resource "aws_cloudwatch_log_group" "this" {
   retention_in_days = 7
 }
 
-# ---------- IAM: execution role (pulls image, writes logs, reads DB secret) ----------
+# ---------- IAM: execution role (pulls image, writes , reads DB secret) ----------
 data "aws_iam_policy_document" "assume" {
   statement {
     actions = ["sts:AssumeRole"]
