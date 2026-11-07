@@ -81,3 +81,28 @@ module "ec2" {
   key_name          = var.key_name
   ssh_allowed_cidr  = var.ssh_allowed_cidr
 }
+# mointoring and alerting module
+module "monitoring" {
+  source              = "./modules/monitoring"
+  sns_topic_arn       = module.sns.topic_arn
+  cluster_arn         = module.ecs.cluster_arn
+  log_group_name      = module.ecs.log_group_name
+  log_group_arn       = module.ecs.log_group_arn
+  ecr_repository_name = module.ecr.repository_name
+}
+module "sns" {
+  source          = "./modules/sns"
+  name            = "${var.project_name}-${var.environment}-alerts"
+  email_addresses = [var.alert_email]
+}
+module "dashboard" {
+  source                  = "./modules/cloudwatch-dashboard"
+  dashboard_name          = "${var.project_name}-${var.environment}"
+  region                  = var.region
+  cluster_name            = module.ecs.cluster_name
+  service_name            = module.ecs.service_name
+  log_group_name          = module.ecs.log_group_name
+  alb_arn_suffix          = module.alb.alb_arn_suffix
+  target_group_arn_suffix = module.alb.target_group_arn_suffix
+  db_identifier           = module.rds.db_identifier
+}

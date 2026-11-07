@@ -119,3 +119,6 @@ variable "ssh_allowed_cidr" {
   description = "CIDR allowed to SSH into the public EC2"
   type        = string
 }
+variable "alert_email" {
+  type = string
+}

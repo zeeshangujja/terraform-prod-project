@@ -1,0 +1,125 @@
+- name: Deploy the Terraform project (runs on the deployer EC2)
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    env: dev
+    region: eu-north-1
+    image_tag: ""
+    project_dir: "{{ playbook_dir | dirname }}"
+    app_dir: "{{ playbook_dir | dirname }}/php-app"
+  environment:
+    HOME: /root
+    AWS_REGION: "{{ region }}"
+    AWS_DEFAULT_REGION: "{{ region }}"
+    TF_IN_AUTOMATION: "1"
+    TF_INPUT: "0"
+    PATH: "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  tasks:
+    - name: Stop if no image tag was given
+      ansible.builtin.assert:
+        that: image_tag | length > 0
+        fail_msg: "Pass the image tag with -e image_tag=..."
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: [unzip, curl, ca-certificates, gnupg, docker.io, jq]
+        update_cache: true
+        state: present
+
+    - name: Make sure Docker is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create the apt keyrings folder
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download the HashiCorp signing key
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /etc/apt/keyrings/hashicorp.asc
+        mode: "0644"
+
+    - name: Add the HashiCorp apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+        filename: hashicorp
+        state: present
+
+    - name: Install Terraform
+      ansible.builtin.apt:
+        name: terraform
+        update_cache: true
+        state: present
+
+    - name: Terraform init
+      ansible.builtin.command: terraform init -input=false
+      args:
+        chdir: "{{ project_dir }}"
+      changed_when: false
+
+    - name: Select (or create) the workspace for this environment
+      ansible.builtin.command: terraform workspace select -or-create {{ env }}
+      args:
+        chdir: "{{ project_dir }}"
+      changed_when: false
+
+    - name: Create the ECR repository first
+      ansible.builtin.command: >
+        terraform apply -auto-approve -input=false
+        -target=module.ecr
+        -var-file={{ env }}.tfvars
+        -var=image_tag={{ image_tag }}
+      args:
+        chdir: "{{ project_dir }}"
+
+    - name: Read the ECR repository URL
+      ansible.builtin.shell: >
+        echo 'module.ecr.repository_url' |
+        terraform console -var-file={{ env }}.tfvars -var=image_tag={{ image_tag }} |
+        tail -n 1 | tr -d '"'
+      args:
+        chdir: "{{ project_dir }}"
+        executable: /bin/bash
+      register: ecr_url
+      changed_when: false
+
+    - name: Work out the registry and the repository name
+      ansible.builtin.set_fact:
+        ecr_full: "{{ ecr_url.stdout | trim }}"
+        ecr_registry: "{{ (ecr_url.stdout | trim).split('/')[0] }}"
+        ecr_repo: "{{ (ecr_url.stdout | trim).split('/')[1:] | join('/') }}"
+
+    - name: Check if this image tag is already in ECR
+      ansible.builtin.command: >
+        aws ecr describe-images
+        --repository-name {{ ecr_repo }}
+        --image-ids imageTag={{ image_tag }}
+        --region {{ region }}
+      register: image_check
+      failed_when: false
+      changed_when: false
+
+    - name: Build and push the Docker image
+      ansible.builtin.shell: |
+        set -eo pipefail
+        aws ecr get-login-password --region {{ region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
+        docker build -t {{ ecr_full }}:{{ image_tag }} {{ app_dir }}
+        docker push {{ ecr_full }}:{{ image_tag }}
+      args:
+        executable: /bin/bash
+      when: image_check.rc != 0
+
+    - name: Terraform apply (everything else, with the new image)
+      ansible.builtin.command: >
+        terraform apply -auto-approve -input=false
+        -var-file={{ env }}.tfvars
+        -var=image_tag={{ image_tag }}
+      args:
+        chdir: "{{ project_dir }}"

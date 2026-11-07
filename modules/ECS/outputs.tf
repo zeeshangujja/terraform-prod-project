@@ -9,3 +9,14 @@ output "cluster_name" {
 output "service_name" {
   value = aws_ecs_service.this.name
 }
+output "cluster_arn" {
+  value = aws_ecs_cluster.this.arn
+}
+
+output "log_group_name" {
+  value = aws_cloudwatch_log_group.this.name
+}
+
+output "log_group_arn" {
+  value = aws_cloudwatch_log_group.this.arn
+}
