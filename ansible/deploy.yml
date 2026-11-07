@@ -1,131 +1,161 @@
-name: deploy
+- name: Deploy (and optionally destroy) the Terraform project on the deployer EC2
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    env: dev
+    region: eu-north-1
+    image_tag: ""
+    action: deploy            # deploy | deploy-and-destroy | destroy-only
+    wait_minutes: 10
+    project_dir: "{{ playbook_dir | dirname }}"
+    app_dir: "{{ playbook_dir | dirname }}/php-app"
+  environment:
+    HOME: /root
+    AWS_REGION: "{{ region }}"
+    AWS_DEFAULT_REGION: "{{ region }}"
+    TF_IN_AUTOMATION: "1"
+    TF_INPUT: "0"
+    PATH: "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-on:
-  workflow_dispatch:
-    inputs:
-      env:
-        description: "Environment"
-        type: choice
-        options: [dev, staging, prod]
-        default: dev
-      action:
-        description: "What to do"
-        type: choice
-        options: [deploy, deploy-and-destroy, destroy-only]
-        default: deploy-and-destroy
-      wait_minutes:
-        description: "Minutes to wait before destroying (deploy-and-destroy only)"
-        type: string
-        default: "10"
+  tasks:
+    - name: Stop if no image tag was given
+      ansible.builtin.assert:
+        that: image_tag | length > 0
+        fail_msg: "Pass the image tag with -e image_tag=..."
 
-permissions:
-  id-token: write
-  contents: read
+    - name: Stop if the action is not one of the allowed values
+      ansible.builtin.assert:
+        that: action in ['deploy', 'deploy-and-destroy', 'destroy-only']
+        fail_msg: "action must be deploy, deploy-and-destroy or destroy-only"
 
-concurrency:
-  group: deploy-${{ inputs.env }}
-  cancel-in-progress: false
+    - name: Never destroy prod from the pipeline
+      ansible.builtin.assert:
+        that: env != 'prod' or action == 'deploy'
+        fail_msg: "Destroy is blocked for prod."
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 100
-    environment: ${{ inputs.env }}
-    env:
-      TARGET_ENV: ${{ inputs.env }}
-      ACTION: ${{ inputs.action }}
-      WAIT_MINUTES: ${{ inputs.wait_minutes }}
-      AWS_REGION: eu-north-1
-    steps:
-      - uses: actions/checkout@v4
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: [unzip, curl, ca-certificates, gnupg, docker.io, jq]
+        update_cache: true
+        state: present
 
-      - name: Safety checks
-        run: |
-          set -euo pipefail
-          if [ "$TARGET_ENV" = "prod" ] && [ "$ACTION" != "deploy" ]; then
-            echo "Destroy is blocked for prod. Use action = deploy."
-            exit 1
-          fi
-          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]] || { echo "wait_minutes must be a number"; exit 1; }
+    - name: Make sure Docker is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
 
-      - name: Log in to AWS (OIDC, no keys)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: eu-north-1
+    - name: Create the apt keyrings folder
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
 
-      - name: Package the project and upload it with the tfvars
-        env:
-          BUCKET: ${{ vars.ARTIFACT_BUCKET }}
-          TFVARS: ${{ secrets.TFVARS }}
-        run: |
-          set -euo pipefail
-          test -n "$TFVARS" || { echo "Secret TFVARS is missing in the ${TARGET_ENV} environment"; exit 1; }
-          echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-          git archive --format=zip -o release.zip HEAD
-          printf '%s\n' "$TFVARS" > "${TARGET_ENV}.tfvars"
-          aws s3 cp release.zip "s3://${BUCKET}/releases/${GITHUB_SHA}.zip"
-          aws s3 cp "${TARGET_ENV}.tfvars" "s3://${BUCKET}/releases/${GITHUB_SHA}-${TARGET_ENV}.tfvars"
-          rm -f "${TARGET_ENV}.tfvars"
+    - name: Download the HashiCorp signing key
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /etc/apt/keyrings/hashicorp.asc
+        mode: "0644"
 
-      - name: Run Ansible on the EC2 through SSM
-        env:
-          BUCKET: ${{ vars.ARTIFACT_BUCKET }}
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-        run: |
-          set -euo pipefail
-          KEY="releases/${GITHUB_SHA}.zip"
-          TFVARS_KEY="releases/${GITHUB_SHA}-${TARGET_ENV}.tfvars"
+    - name: Add the HashiCorp apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+        filename: hashicorp
+        state: present
 
-          cat > remote.sh <<EOF
-          #!/bin/bash
-          set -euo pipefail
-          export HOME=/root
-          export DEBIAN_FRONTEND=noninteractive
-          export PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
-          apt-get update -y
-          apt-get install -y unzip curl ansible
-          if ! command -v aws >/dev/null 2>&1; then
-            curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
-            unzip -q -o /tmp/awscliv2.zip -d /tmp
-            /tmp/aws/install
-          fi
-          rm -rf /opt/deploy
-          mkdir -p /opt/deploy
-          aws s3 cp s3://${BUCKET}/${KEY} /tmp/release.zip --region ${AWS_REGION}
-          unzip -q -o /tmp/release.zip -d /opt/deploy
-          aws s3 cp s3://${BUCKET}/${TFVARS_KEY} /opt/deploy/${TARGET_ENV}.tfvars --region ${AWS_REGION}
-          trap 'rm -f /opt/deploy/${TARGET_ENV}.tfvars /tmp/release.zip; aws s3 rm s3://${BUCKET}/${TFVARS_KEY} --region ${AWS_REGION} || true' EXIT
-          cd /opt/deploy/ansible
-          ansible-playbook deploy.yml -e env=${TARGET_ENV} -e image_tag=${TAG} -e region=${AWS_REGION} -e action=${ACTION} -e wait_minutes=${WAIT_MINUTES}
-          EOF
+    - name: Install Terraform
+      ansible.builtin.apt:
+        name: terraform
+        update_cache: true
+        state: present
 
-          jq -Rs '{commands: split("\n"), executionTimeout: ["4800"]}' remote.sh > params.json
+    - name: Terraform init
+      ansible.builtin.command: terraform init -input=false
+      args:
+        chdir: "{{ project_dir }}"
+      changed_when: false
 
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "${ACTION} ${TARGET_ENV} ${TAG}" \
-            --parameters file://params.json \
-            --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/ssm/terraform-deploy \
-            --query "Command.CommandId" --output text)
-          echo "SSM command: $CMD_ID"
+    - name: Select (or create) the workspace for this environment
+      ansible.builtin.command: terraform workspace select -or-create {{ env }}
+      args:
+        chdir: "{{ project_dir }}"
+      changed_when: false
 
-          STATUS="Pending"
-          for i in $(seq 1 300); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "[$i] status: $STATUS"
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 15
-          done
+    # ---------- Build and deploy (skipped for destroy-only) ----------
+    - name: Build the image and deploy everything
+      when: action != 'destroy-only'
+      block:
+        - name: Create the ECR repository first
+          ansible.builtin.command: >
+            terraform apply -auto-approve -input=false
+            -target=module.ecr
+            -var-file={{ env }}.tfvars
+            -var=image_tag={{ image_tag }}
+          args:
+            chdir: "{{ project_dir }}"
 
-          echo "---------- output (last lines) ----------"
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text | tail -n 60
-          echo "---------- errors (last lines) ----------"
-          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text | tail -n 30
-          test "$STATUS" = "Success"
+        - name: Read the ECR repository URL
+          ansible.builtin.shell: >
+            echo 'module.ecr.repository_url' |
+            terraform console -var-file={{ env }}.tfvars -var=image_tag={{ image_tag }} |
+            tail -n 1 | tr -d '"'
+          args:
+            chdir: "{{ project_dir }}"
+            executable: /bin/bash
+          register: ecr_url
+          changed_when: false
+
+        - name: Work out the registry and the repository name
+          ansible.builtin.set_fact:
+            ecr_full: "{{ ecr_url.stdout | trim }}"
+            ecr_registry: "{{ (ecr_url.stdout | trim).split('/')[0] }}"
+            ecr_repo: "{{ (ecr_url.stdout | trim).split('/')[1:] | join('/') }}"
+
+        - name: Check if this image tag is already in ECR
+          ansible.builtin.command: >
+            aws ecr describe-images
+            --repository-name {{ ecr_repo }}
+            --image-ids imageTag={{ image_tag }}
+            --region {{ region }}
+          register: image_check
+          failed_when: false
+          changed_when: false
+
+        - name: Build and push the Docker image
+          ansible.builtin.shell: |
+            set -eo pipefail
+            aws ecr get-login-password --region {{ region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
+            docker build -t {{ ecr_full }}:{{ image_tag }} {{ app_dir }}
+            docker push {{ ecr_full }}:{{ image_tag }}
+          args:
+            executable: /bin/bash
+          when: image_check.rc != 0
+
+        - name: Terraform apply (everything else, with the new image)
+          ansible.builtin.command: >
+            terraform apply -auto-approve -input=false
+            -var-file={{ env }}.tfvars
+            -var=image_tag={{ image_tag }}
+          args:
+            chdir: "{{ project_dir }}"
+
+    # ---------- Test window, then destroy ----------
+    - name: Wait so you can test the app before it is destroyed
+      ansible.builtin.wait_for:
+        timeout: "{{ (wait_minutes | int) * 60 }}"
+      when: action == 'deploy-and-destroy' and (wait_minutes | int) > 0
+
+    - name: Terraform destroy (deletes everything Terraform created in this environment)
+      ansible.builtin.command: >
+        terraform destroy -auto-approve -input=false
+        -var-file={{ env }}.tfvars
+        -var=image_tag={{ image_tag }}
+      args:
+        chdir: "{{ project_dir }}"
+      when: action in ['deploy-and-destroy', 'destroy-only']
+
+    - name: Remove old Docker images and build cache
+      ansible.builtin.command: docker system prune -af --filter "until=72h"
+      changed_when: false
+      failed_when: false
