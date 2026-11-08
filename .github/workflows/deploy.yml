@@ -97,7 +97,7 @@ jobs:
           aws s3 cp s3://${BUCKET}/${TFVARS_KEY} /opt/deploy/${TARGET_ENV}.tfvars --region ${AWS_REGION}
           trap 'rm -f /opt/deploy/${TARGET_ENV}.tfvars /tmp/release.zip; aws s3 rm s3://${BUCKET}/${TFVARS_KEY} --region ${AWS_REGION} || true' EXIT
           cd /opt/deploy/ansible
-          ansible-playbook deploy.yml -e env=${TARGET_ENV} -e image_tag=${TAG} -e region=${AWS_REGION} -e run_action=${ACTION} -e wait_minutes=${WAIT_MINUTES}
+          ansible-playbook deploy.yml -e env=${TARGET_ENV} -e image_tag=${TAG} -e region=${AWS_REGION} -e action=${ACTION} -e wait_minutes=${WAIT_MINUTES}
           EOF
 
           jq -Rs '{commands: split("\n"), executionTimeout: ["4800"]}' remote.sh > params.json
