@@ -122,3 +122,15 @@ variable "ssh_allowed_cidr" {
 variable "alert_email" {
   type = string
 }
+variable "frontend_repo_url" { type = string }
+variable "frontend_branch"   { type = string }
+
+variable "github_token" {
+  type      = string
+  sensitive = true
+}
+
+variable "app_secrets" {
+  type      = map(string)
+  sensitive = true
+}

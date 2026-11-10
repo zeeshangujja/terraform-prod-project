@@ -99,7 +99,7 @@ resource "aws_ecs_task_definition" "this" {
 
     # username and password are read from Secrets Manager at start time
     secrets = [
-      { name = "DB_USER",     valueFrom = "${var.db_secret_arn}:username::" },
+      { name = "DB_USER", valueFrom = "${var.db_secret_arn}:username::" },
       { name = "DB_PASSWORD", valueFrom = "${var.db_secret_arn}:password::" }
     ]
 

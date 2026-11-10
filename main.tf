@@ -62,10 +62,12 @@ module "ecs" {
   container_memory   = var.container_memory
   desired_count      = var.desired_count
 
-  db_host       = module.rds.address
-  db_port       = module.rds.port
-  db_name       = var.db_name
-  db_secret_arn = module.rds.secret_arn
+  db_host         = module.rds.address
+  db_port         = module.rds.port
+  db_name         = var.db_name
+  db_secret_arn   = module.rds.secret_arn
+  app_secret_arn  = module.secrets.secret_arn
+  app_secret_keys = module.secrets.secret_keys
 }
 
 #Adding the EC2 module to the main.tf file
@@ -106,3 +108,17 @@ module "dashboard" {
   target_group_arn_suffix = module.alb.target_group_arn_suffix
   db_identifier           = module.rds.db_identifier
 }
+module "secrets" {
+  source      = "./modules/secrets-manager"
+  environment = var.environment
+  app_secrets = var.app_secrets
+}
+
+module "amplify" {
+  source         = "./modules/amplify"
+  environment    = var.environment
+  repository_url = var.frontend_repo_url
+  branch_name    = var.frontend_branch
+  github_token   = var.github_token
+  alb_dns_name   = module.alb.alb_dns_name
+} 
