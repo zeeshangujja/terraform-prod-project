@@ -120,5 +120,10 @@ module "amplify" {
   repository_url = var.frontend_repo_url
   branch_name    = var.frontend_branch
   github_token   = var.github_token
-  alb_dns_name   = module.alb.alb_dns_name
+  api_domain     = module.alb.alb_dns_name
 } 
+module "cloudfront_api" {
+  source       = "./modules/cloudfront-api"
+  environment  = var.environment
+  alb_dns_name = module.alb.alb_dns_name
+}
