@@ -124,13 +124,16 @@
 
         - name: Build and push the Docker image
           ansible.builtin.shell: |
-            set -eo pipefail
-            aws ecr get-login-password --region {{ region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
-            docker build -t {{ ecr_full }}:{{ image_tag }} {{ app_dir }}
+            set -euo pipefail
+
+            aws ecr get-login-password --region {{ region }} |
+              docker login --username AWS --password-stdin {{ ecr_registry }}
+
+            docker build --pull -t {{ ecr_full }}:{{ image_tag }} {{ app_dir }}
+
             docker push {{ ecr_full }}:{{ image_tag }}
           args:
             executable: /bin/bash
-          when: image_check.rc != 0
 
         - name: Terraform apply (everything else, with the new image)
           ansible.builtin.command: >

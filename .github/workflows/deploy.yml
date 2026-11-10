@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$TFVARS" || { echo "Secret TFVARS is missing in the ${TARGET_ENV} environment"; exit 1; }
-          echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "TAG=${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
           git archive --format=zip -o release.zip HEAD
           printf '%s\n' "$TFVARS" > "${TARGET_ENV}.tfvars"
           aws s3 cp release.zip "s3://${BUCKET}/releases/${GITHUB_SHA}.zip"
