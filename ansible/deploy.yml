@@ -9,7 +9,7 @@
     action: deploy            # deploy | deploy-and-destroy | destroy-only
     wait_minutes: 10
     project_dir: "{{ playbook_dir | dirname }}"
-    app_dir: "{{ playbook_dir | dirname }}/NodeApp"
+    app_dir: "{{ playbook_dir | dirname }}/Nodeapp"
   environment:
     HOME: /root
     AWS_REGION: "{{ region }}"
