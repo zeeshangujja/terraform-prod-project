@@ -30,7 +30,7 @@ resource "aws_amplify_app" "frontend" {
   # 1) Send /api/* to the ALB (must be first)
   custom_rule {
     source = "/api/<*>"
-    target = "http://${var.api_domain}/api/<*>"
+    target = "https://${var.api_domain}/api/<*>"
     status = "200"
   }
 
